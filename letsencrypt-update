@@ -1,0 +1,153 @@
+#!/usr/bin/env php
+<?php
+	require_once(__DIR_'/ACMECert.php');
+	$le_key = __DIR_'/account_key.pem';
+	$le_email = 'your@email.here';
+	$rootca = file_get_contents('https://letsencrypt.org/certs/isrgrootx1.pem');
+	
+	$sslroot = '/etc/ssl/web/';
+	$db = new mysqli('localhost', 'dbuser', 'dbpass', 'dbname');
+	
+
+	function nsupdate($key, $domain, $challenge) {
+		// prepare command
+		$file = tempnam(sys_get_temp_dir(), uniqid());
+		$zone = implode('.',array_slice(explode('.', $domain),-2));
+		$data = 'server localhost'.PHP_EOL.'zone '.$zone.PHP_EOL.'update delete _acme-challenge.'.$domain.'. TXT'.PHP_EOL.'update add _acme-challenge.'.$domain.'. 60 IN TXT "'.$challenge.'"'.PHP_EOL.'send'.PHP_EOL;
+		file_put_contents($file, $data);
+		passthru('/usr/bin/nsupdate -k '.$key.' '.$file);
+		unlink($file);
+		
+		// Confirm updates on all
+		$zone = implode('.',array_slice(explode('.', $domain),-2));
+		$data = dns_get_record($zone, DNS_NS);
+		$ok = [];
+		while (true)
+		{
+			foreach($data AS $server)
+			{
+				if (in_array($server['target'], $ok))
+					continue;
+				$test = exec('host -t TXT _acme-challenge.'.$domain.' '.$server['target']);
+				echo $test.PHP_EOL;
+				if (strstr($test, $challenge))
+					$ok[] = $server['target'];
+			}
+			if (count($ok) == count($data))
+				break;
+			else
+				sleep(10);
+		}
+		return;
+	}
+	
+	$ac = new ACMECert();
+
+	if (!file_exists($le_key))
+	{
+		// Create LetsEncrypt Accout Key
+		$key = $ac->generateRSAKey(4096);
+		file_put_contents($le_key, $key);
+		
+		// Register with LetsEncrypt
+		$ac->loadAccountKey('file://'.$le_key);
+		$ac->register(true, $le_email);
+	}
+	else
+		$ac->loadAccountKey('file://'.$le_key);
+
+	$mailcert_updated = false;	
+	$query = $db->query("SELECT * FROM `sites` WHERE `active`='1'");
+	while ($site = $query->fetch_array())
+	{
+		echo 'Checking '.$site['name'].': '.PHP_EOL;
+		if (!file_exists($sslroot.$site['name']))
+		{
+			mkdir($sslroot.$site['name']);
+			echo ' - Created folder for ssl'.PHP_EOL;
+		}
+
+		$pemfile = $sslroot.$site['name'].'/server.pem';
+		if (!file_exists($pemfile))
+		{
+			echo ' - Creating private key (PEM)'.PHP_EOL;
+			openssl_pkey_export(openssl_pkey_new(), $pem);
+			file_put_contents($pemfile, $pem);
+		}
+
+		$domains = preg_split("/[\s,;\n]+/", $site['domains']);
+		$csrfile = $sslroot.$site['name'].'/server.csr';
+		$crtfile = $sslroot.$site['name'].'/server.crt';
+		if (file_exists($crtfile))
+		{
+			echo ' - Reading existing cert (CRT)'.PHP_EOL;
+			$data = openssl_x509_parse(file_get_contents($crtfile));
+			preg_match_all('/DNS:([\w\.]+)/', $data['extensions']['subjectAltName'], $cert_sni);
+			$diff1 = array_diff($domains, $cert_sni[1]);
+			$diff2 = array_diff($cert_sni[1], $domains);
+			$renew = $data['validTo_time_t'] - ($site['renewdays']*86400);
+
+			if (!empty($diff1) || !empty($diff2))
+			{
+				echo ' - Regenerating because domain list differs:'.PHP_EOL;
+				echo ' * Added  : '.implode(' ',$diff1).PHP_EOL;
+				echo ' * Removed: '.implode(' ',$diff2).PHP_EOL;
+				if (file_exists($csrfile))
+					unlink($csrfile);
+			}
+			else if (time() < $renew)
+			{
+				echo ' * Valid  : '.date('d-m-Y H:i:s', $data['validTo_time_t']).PHP_EOL;
+				echo ' * Renewal: '.date('d-m-Y', $renew).PHP_EOL;
+				continue;
+			}
+		}
+
+		$domain_config = [];
+		foreach($domains AS $d)
+		{
+			$domain_config[$d] = ['challenge' => (!empty($site['nsupdate']) ? 'dns-01' : 'http-01')];
+			if (empty($site['nsupdate']))
+				$domain_config[$d]['docroot'] = $site['webroot'];
+			else
+				$domain_config[$d]['nskey'] = $site['nsupdate'];
+		}
+		
+		$handler = function($opts) use ($ac)
+		{
+			switch($opts['config']['challenge'])
+			{
+				case 'http-01':
+					$fn = $opts['config']['docroot'].$opts['key'];
+					@mkdir(dirname($fn),0777,true);
+					file_put_contents($fn, $opts['value']);
+					return function($opts) use ($fn) { unlink($fn); };
+					break;
+				case 'dns-01': // manual example:
+					nsupdate($opts['config']['nskey'], $opts['domain'], $opts['value']);
+					break;
+			}
+		};
+		
+		$csrfile = $sslroot.$site['name'].'/server.csr';
+		if (!file_exists($csrfile))
+		{
+			echo ' - Generating signing request (CSR)'.PHP_EOL;
+			$csr = $ac->generateCSR('file://'.$pemfile, array_keys($domain_config));
+			file_put_contents($csrfile, $csr);
+		}
+		else
+			$csr = file_get_contents($csrfile);
+				
+		echo ' - Requesting certificate (CRT)'.PHP_EOL;
+		$crt = $ac->getCertificateChain($csr,$domain_config,$handler);
+		
+		if ($rootca)
+			file_put_contents($sslroot.$site['name'].'/server.ca', $rootca);
+		file_put_contents($sslroot.$site['name'].'/server.crt', $crt);
+
+		echo ' - Succeeded'.PHP_EOL;
+	}
+
+	exit;
+?>

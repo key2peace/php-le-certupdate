@@ -13,7 +13,7 @@ Update your Letsencrypt certs using php-cli
   - nsupdate points to the private rdns key to use with nsupdate (needed for DNS-01)
   - renewdays tells the script how long before expire of the cert it should be renewed
  
-Certs are deposited in /etc/ssl/<name>/
+Certs are deposited in /etc/ssl/\<name\>/
 
 ## Credits
 https://github.com/skoerfgen/ACMECert
